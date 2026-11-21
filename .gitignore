@@ -1,0 +1,11 @@
+/build/
+/data/
+/dev/
+/output/
+/scratch/
+/dev-answer/
+/generator/
+__pycache__/
+/timing/
+/practice/
+/final/
