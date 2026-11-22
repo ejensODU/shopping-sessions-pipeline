@@ -1078,10 +1078,7 @@ bool run_compact(const PreadInput& ev_in, size_t ev_buckets, const fs::path& dat
                 if (!split_fields_slow<7>(SV(line_start, llen), f) || f[0].empty()) continue;
                 int64_t dms = 0;
                 int64_t ing_s = ft.parse_ingest_sec(f[3], dms);
-                if (ing_s == INVALID_TS) {
-                    ingest_overflow.store(true, std::memory_order_relaxed);
-                    return;
-                }
+                if (ing_s == INVALID_TS) continue;
                 int64_t ioff_s = ing_s - ingest_epoch_sec;
                 if (uint64_t(ioff_s) >= (uint64_t{1} << 32)) {
                     ingest_overflow.store(true, std::memory_order_relaxed);

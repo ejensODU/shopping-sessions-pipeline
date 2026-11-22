@@ -3,45 +3,11 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
-#include <fstream>
-#include <sstream>
 #include <stdexcept>
-#include <string>
 #include <sys/mman.h>
 #include <vector>
 
 namespace blitz {
-
-// Safe runtime THP probe: enables MADV_HUGEPAGE only when the kernel either never
-// triggers synchronous compaction (`[never]`/`[defer]`/`[defer+madvise]`) OR already
-// has >= 4 GiB of contiguous 2 MiB blocks free in `/proc/buddyinfo` Normal zone.
-inline bool safe_for_thp() {
-    static const bool ok = []() -> bool {
-        std::ifstream df("/sys/kernel/mm/transparent_hugepage/defrag");
-        std::string dline;
-        if (df && std::getline(df, dline)) {
-            if (dline.find("[never]") != std::string::npos ||
-                dline.find("[defer]") != std::string::npos ||
-                dline.find("[defer+madvise]") != std::string::npos) {
-                return true;
-            }
-        }
-        std::ifstream bi("/proc/buddyinfo");
-        std::string line;
-        uint64_t ready_2mb = 0;
-        while (bi && std::getline(bi, line)) {
-            size_t pos = line.find("Normal");
-            if (pos == std::string::npos) continue;
-            std::istringstream iss(line.substr(pos + 6));
-            uint64_t ord[11]{};
-            int k = 0;
-            while (k < 11 && (iss >> ord[k])) ++k;
-            if (k >= 10) ready_2mb += ord[9] + (k >= 11 ? 2 * ord[10] : 0);
-        }
-        return ready_2mb >= 2048;
-    }();
-    return ok;
-}
 
 // Per-worker private 16 KiB slab allocator backed by 64 MiB anonymous mmap chunks.
 // Zero cross-thread VMA lock contention, zero atomic contention, and supports
@@ -63,9 +29,6 @@ private:
         void* mem = ::mmap(nullptr, CHUNK_BYTES, PROT_READ | PROT_WRITE,
                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (mem == MAP_FAILED) throw std::runtime_error("WorkerArena mmap failed");
-#ifdef MADV_HUGEPAGE
-        if (safe_for_thp()) ::madvise(mem, CHUNK_BYTES, MADV_HUGEPAGE);
-#endif
         chunks_[cid] = static_cast<uint8_t*>(mem);
         return chunks_[cid];
     }

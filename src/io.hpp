@@ -185,6 +185,7 @@ class PreadInput {
             ::close(fd);
             return;
         }
+        ::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
         size_t hdr_end = find_header_end(fd, sz);
         files_.push_back({fd, sz, hdr_end});
         total_bytes += sz;

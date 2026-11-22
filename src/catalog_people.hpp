@@ -259,12 +259,6 @@ public:
             ::mmap(nullptr, tcap * sizeof(uint64_t), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
         auto* parent = static_cast<std::atomic<uint32_t>*>(
             ::mmap(nullptr, tcap * sizeof(uint32_t), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-#ifdef MADV_HUGEPAGE
-        if (safe_for_thp()) {
-            if (tcap * sizeof(uint64_t) >= (2u << 20)) ::madvise(t_key, tcap * sizeof(uint64_t), MADV_HUGEPAGE);
-            if (tcap * sizeof(uint32_t) >= (2u << 20)) ::madvise(parent, tcap * sizeof(uint32_t), MADV_HUGEPAGE);
-        }
-#endif
 
         auto intern = [&](uint64_t k) __attribute__((always_inline)) -> uint32_t {
             size_t pos = size_t(fast_hash(k)) & tmask;
@@ -359,11 +353,6 @@ public:
         slot_mask_ = cap - 1;
         slots_ = static_cast<Slot*>(::mmap(nullptr, cap * sizeof(Slot),
                                            PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-#ifdef MADV_HUGEPAGE
-        if (safe_for_thp() && cap * sizeof(Slot) >= (2u << 20)) {
-            ::madvise(slots_, cap * sizeof(Slot), MADV_HUGEPAGE);
-        }
-#endif
 
         parallel_for(nblocks, threads, [&](unsigned, size_t bi) {
             const size_t lo = bi * VSTEP;
