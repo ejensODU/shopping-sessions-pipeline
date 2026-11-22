@@ -1,17 +1,24 @@
 CXX ?= g++
-PYTHON ?= python3
-ARROW_DIR ?= $(shell $(PYTHON) -c 'import importlib.util; print(importlib.util.find_spec("pyarrow").submodule_search_locations[0])' 2>/dev/null)
-ARCH_FLAGS ?= -march=x86-64-v3
-ARROW_LIBS := libparquet.so.2600 libarrow.so.2600
+CXXFLAGS ?= -O3 -flto=auto -std=c++20 -march=x86-64-v3 -pthread -Wall -Wextra
+LDFLAGS ?= -pthread
+IMAGE ?= shopping-sessions:latest
+PLATFORM ?= linux/amd64
 
-.PHONY: local
-local: build/shopping-sessions
+.PHONY: all static clean build
 
-build/shopping-sessions: src/main.cpp $(wildcard src/*.hpp) Makefile
-	@test -f "$(ARROW_DIR)/include/parquet/file_writer.h" || { echo "Install pyarrow==26.0.1 or set ARROW_DIR to its package directory." >&2; exit 1; }
-	mkdir -p build/lib
-	$(CXX) -O3 -std=c++20 $(ARCH_FLAGS) -DNDEBUG -pthread $(CPPFLAGS) $(CXXFLAGS) \
-	  -isystem "$(ARROW_DIR)/include" src/main.cpp -o $@ $(LDFLAGS) \
-	  -L"$(ARROW_DIR)" -Wl,-rpath-link,"$(ARROW_DIR)" -Wl,-rpath,'$$ORIGIN/lib' \
-	  $(addprefix -l:,$(ARROW_LIBS))
-	@for library in $(ARROW_LIBS); do ln -sf "$(abspath $(ARROW_DIR))/$$library" "build/lib/$$library"; done
+all: build/shopping-sessions
+
+build/shopping-sessions: src/main.cpp src/arena.hpp src/catalog_people.hpp src/io.hpp src/keys.hpp src/parquet_writer.hpp src/parse.hpp
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) src/main.cpp $(LDFLAGS) -o $@
+
+static: src/main.cpp src/arena.hpp src/catalog_people.hpp src/io.hpp src/keys.hpp src/parquet_writer.hpp src/parse.hpp
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) -static src/main.cpp $(LDFLAGS) -o build/shopping-sessions
+	strip build/shopping-sessions
+
+build:
+	docker buildx build --platform $(PLATFORM) --load -t $(IMAGE) .
+
+clean:
+	rm -rf build

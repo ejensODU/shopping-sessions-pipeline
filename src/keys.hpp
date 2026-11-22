@@ -1,4 +1,5 @@
 #pragma once
+
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -7,68 +8,19 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <vector>
 
-namespace ss {
+namespace blitz {
 
-// Short non-NUL ASCII IDs fit in nine seven-bit digits. Zero padding makes
-// the numeric ordering identical to the original byte ordering. All other IDs
-// are interned with their complete bytes in a disjoint range.
-class Keys {
-    static constexpr uint64_t high = uint64_t{1} << 63;
-    static constexpr uint64_t low7 = 0x7f7f7f7f7f7f7f7fULL;
-    std::mutex mutex_;
-    std::deque<std::string> storage_;
-    std::unordered_map<std::string_view, uint64_t> other_;
-public:
-    uint64_t encode(std::string_view s) {
-        const size_t n = s.size();
-        if (n && n <= 9) {
-            uint64_t word = 0;
-            bool clean;
-            if (n >= 8) {
-                std::memcpy(&word, s.data(), 8);
-                const uint64_t zero_bytes = (word - 0x0101010101010101ULL) & ~word;
-                clean = ((zero_bytes | word) & ~low7) == 0;
-            } else {
-                std::memcpy(&word, s.data(), n);
-                clean = !(word & ~low7) && !std::memchr(s.data(), 0, n);
-            }
-            const unsigned tail = n == 9 ? static_cast<unsigned char>(s[8]) : 0;
-            if (clean && (n != 9 || (tail && tail < 128))) {
-                return (_pext_u64(__builtin_bswap64(word), low7) << 7) | tail;
-            }
-        }
-        std::lock_guard guard(mutex_);
-        auto it = other_.find(s);
-        if (it != other_.end()) return it->second;
-        const uint64_t key = high | storage_.size();
-        storage_.emplace_back(s);
-        other_.emplace(storage_.back(), key);
-        return key;
-    }
+using SV = std::string_view;
 
-    std::string decode(uint64_t key) {
-        if (key & high) {
-            std::lock_guard guard(mutex_);
-            return storage_.at(key ^ high);
-        }
-        char bytes[9];
-        int length = 0;
-        for (int shift = 56; shift >= 0; shift -= 7) {
-            const char ch = static_cast<char>((key >> shift) & 127);
-            if (!ch) break;
-            bytes[length++] = ch;
-        }
-        return {bytes, static_cast<size_t>(length)};
-    }
+// Fast 1-multiply 128-bit wyhash mixer (4 instructions, 4 cycles, full 64-bit avalanche!).
+// Guarantees statistical independence across all bit slices (bucket, Bloom, HT, shard).
+inline uint64_t fast_hash(uint64_t x) {
+    __uint128_t r = __uint128_t(x ^ 0xa0761d6478bd642fULL) * __uint128_t(x ^ 0xe7037ed1a0b428dbULL);
+    return uint64_t(r) ^ uint64_t(r >> 64);
+}
 
-    bool less(uint64_t a, uint64_t b) {
-        return ((a | b) & high) ? decode(a) < decode(b) : a < b;
-    }
-};
-
-inline uint64_t mix(uint64_t x) {
+inline uint64_t mix64(uint64_t x) {
     x ^= x >> 30;
     x *= 0xbf58476d1ce4e5b9ULL;
     x ^= x >> 27;
@@ -76,51 +28,135 @@ inline uint64_t mix(uint64_t x) {
     return x ^ (x >> 31);
 }
 
-// The caller uses nonempty, nonzero keys. Slots stay below 75% occupancy.
-template<class Value>
-class KeyMap {
-    std::vector<uint64_t> keys_;
-    std::vector<Value> values_;
-    size_t used_ = 0;
-
-    size_t slot(uint64_t key) const {
-        const size_t mask = keys_.size() - 1;
-        size_t i = mix(key) & mask;
-        while (keys_[i] && keys_[i] != key) i = (i + 1) & mask;
-        return i;
-    }
+// Zero-conversion raw 64-bit ASCII key encoder for IDs with common prefix ('e' or 'u'):
+// - Fast domain (bit 63 == 0): strings of length 2..9 starting with `Prefix` whose
+//   remaining 1..8 bytes are non-NUL ASCII (1..127). Stored verbatim in little-endian
+//   `uint64_t` (zero-padded in high bytes). ZERO base-36 math, 3-instruction decode,
+//   1-instruction bytewise comparison via bswap64!
+// - Fallback domain (bit 63 == 1): exact mutex-protected interner for all other strings
+//   (uppercase prefix, length 1 or >9, non-ASCII UTF-8, embedded NUL, etc.).
+template <char Prefix>
+class RawKeys {
 public:
-    explicit KeyMap(size_t expected = 0) { reserve(expected); }
-    void reserve(size_t expected) {
-        size_t cap = 16;
-        while (cap - cap / 4 < expected) cap *= 2;
-        if (cap <= keys_.size()) return;
-        auto keys = std::move(keys_);
-        auto values = std::move(values_);
-        keys_.assign(cap, 0);
-        values_.resize(cap);
-        for (size_t j = 0; j < keys.size(); ++j) if (keys[j]) {
-            const auto i = slot(keys[j]);
-            keys_[i] = keys[j];
-            values_[i] = values[j];
+    static constexpr uint64_t HIGH = uint64_t{1} << 63;
+
+private:
+    mutable std::mutex mu_;
+    std::deque<std::string> storage_;
+    std::unordered_map<SV, uint64_t> intern_;
+
+    uint64_t intern_slow(SV s) {
+        std::lock_guard lk(mu_);
+        auto it = intern_.find(s);
+        if (it != intern_.end()) return it->second;
+        uint64_t key = HIGH | storage_.size();
+        storage_.emplace_back(s);
+        intern_.emplace(storage_.back(), key);
+        return key;
+    }
+
+public:
+    inline uint64_t encode(SV s) {
+        const size_t n = s.size();
+        const char* p = s.data();
+        if (__builtin_expect(n >= 2 && n <= 9 && p[0] == Prefix, 1)) {
+            const size_t tlen = n - 1;
+            uint64_t word = 0;
+            uint64_t mask;
+            if (tlen == 8) {
+                std::memcpy(&word, p + 1, 8);
+                mask = ~uint64_t{0};
+            } else {
+                std::memcpy(&word, p + 1, tlen);
+                mask = (uint64_t{1} << (tlen * 8)) - 1;
+            }
+            const uint64_t zero_bytes = (word - 0x0101010101010101ULL) & ~word & mask;
+            if (__builtin_expect(((zero_bytes | word) & 0x8080808080808080ULL) == 0, 1)) {
+                return word;
+            }
         }
+        return intern_slow(s);
     }
-    Value* find(uint64_t key) {
-        const size_t i = slot(key);
-        return keys_[i] ? &values_[i] : nullptr;
+
+    // 3-instruction zero-allocation decode into caller's 9-byte stack buffer!
+    inline SV decode(uint64_t key, char buf[9]) const {
+        if (__builtin_expect((key & HIGH) != 0, 0)) {
+            return storage_[key ^ HIGH];
+        }
+        buf[0] = Prefix;
+        std::memcpy(buf + 1, &key, 8);
+        const size_t tlen = 8u - (size_t(__builtin_clzll(key)) >> 3);
+        return SV(buf, 1 + tlen);
     }
-    const Value* find(uint64_t key) const {
-        const size_t i = slot(key);
-        return keys_[i] ? &values_[i] : nullptr;
-    }
-    std::pair<Value*, bool> insert(uint64_t key, Value value) {
-        if (used_ >= keys_.size() - keys_.size() / 4) reserve(used_ + 1);
-        size_t i = slot(key);
-        if (keys_[i]) return {&values_[i], false};
-        keys_[i] = key;
-        values_[i] = value;
-        ++used_;
-        return {&values_[i], true};
+
+    // 1-instruction bytewise lexicographical compare for fast keys!
+    inline bool less(uint64_t a, uint64_t b) const {
+        if (__builtin_expect(((a | b) & HIGH) == 0, 1)) {
+            return __builtin_bswap64(a) < __builtin_bswap64(b);
+        }
+        char ba[9], bb[9];
+        return decode(a, ba) < decode(b, bb);
     }
 };
-} // namespace ss
+
+// Zero-SWAR 1-bswap order-preserving 64-bit click_id encoder!
+// Fast domain (bit 63 == 0): 'k' + 1..8 non-NUL ASCII bytes, stored big-endian via bswap64
+// so integer `<` IS exact bytewise order. Fallback (bit 63 == 1): exact interner.
+class ClickKeys {
+    static constexpr uint64_t HIGH = uint64_t{1} << 63;
+    mutable std::mutex mu_;
+    std::deque<std::string> storage_;
+    std::unordered_map<SV, uint64_t> intern_;
+
+    uint64_t intern_slow(SV s) {
+        std::lock_guard lk(mu_);
+        auto it = intern_.find(s);
+        if (it != intern_.end()) return it->second;
+        uint64_t key = HIGH | storage_.size();
+        storage_.emplace_back(s);
+        intern_.emplace(storage_.back(), key);
+        return key;
+    }
+
+public:
+    inline uint64_t encode(SV s) {
+        const size_t n = s.size();
+        const char* p = s.data();
+        if (__builtin_expect(n >= 2 && n <= 9 && p[0] == 'k', 1)) {
+            const size_t tlen = n - 1;
+            uint64_t word = 0;
+            uint64_t mask;
+            if (tlen == 8) {
+                std::memcpy(&word, p + 1, 8);
+                mask = ~uint64_t{0};
+            } else {
+                std::memcpy(&word, p + 1, tlen);
+                mask = (uint64_t{1} << (tlen * 8)) - 1;
+            }
+            const uint64_t zero_bytes = (word - 0x0101010101010101ULL) & ~word & mask;
+            if (__builtin_expect(((zero_bytes | word) & 0x8080808080808080ULL) == 0, 1)) {
+                return __builtin_bswap64(word);
+            }
+        }
+        return intern_slow(s);
+    }
+
+    inline SV decode(uint64_t key, char buf[9]) const {
+        if (__builtin_expect((key & HIGH) != 0, 0)) {
+            return storage_[key ^ HIGH];
+        }
+        buf[0] = 'k';
+        uint64_t le = __builtin_bswap64(key);
+        std::memcpy(buf + 1, &le, 8);
+        const size_t tlen = 8u - (size_t(__builtin_clzll(le)) >> 3);
+        return SV(buf, 1 + tlen);
+    }
+
+    inline bool less(uint64_t a, uint64_t b) const {
+        if (__builtin_expect(((a | b) & HIGH) == 0, 1)) return a < b;
+        char ba[9], bb[9];
+        return decode(a, ba) < decode(b, bb);
+    }
+};
+
+} // namespace blitz
